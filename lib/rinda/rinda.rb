@@ -277,6 +277,14 @@ module Rinda
     end
 
     ##
+    # Atomically takes a distinct tuple for each template from the proxied
+    # TupleSpace. See TupleSpace#take_all.
+
+    def take_all(tuples, sec=nil, &block)
+      @ts.take_all(tuples, sec, &block)
+    end
+
+    ##
     # Reads +tuple+ from the proxied TupleSpace.  See TupleSpace#read.
 
     def read(tuple, sec=nil, &block)
@@ -326,4 +334,3 @@ module Rinda
   end
 
 end
-

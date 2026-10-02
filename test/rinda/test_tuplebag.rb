@@ -134,6 +134,66 @@ class TestTupleBag < Test::Unit::TestCase
     assert_equal [], @tb.find_all_template(tuple), 'expired'
   end
 
+  def test_find_matching_all
+    t1 = tup(:val, 1)
+    t2 = tup(:val, 2)
+    @tb.push(t1)
+    @tb.push(t2)
+
+    entries = @tb.find_matching_all([tem(:val, 1), tem(:val, nil)])
+
+    assert_equal([t1, t2], entries)
+    assert_equal(2, entries.map(&:object_id).uniq.size)
+  end
+
+  def test_find_matching_all_duplicate_tuples
+    t1 = tup(:same)
+    t2 = tup(:same)
+    @tb.push(t1)
+    @tb.push(t2)
+
+    entries = @tb.find_matching_all([tem(nil), tem(nil)])
+
+    assert_equal([t1, t2], entries)
+    assert_equal(2, entries.map(&:object_id).uniq.size)
+  end
+
+  def test_find_matching_all_exhaustive
+    entries = 3.times.map { |i| tup(i) }
+    entries.each { |entry| @tb.push(entry) }
+
+    (0...(1 << 9)).each do |mask|
+      templates = 3.times.map do |row|
+        allowed = 3.times.filter_map do |column|
+          column if mask[row * 3 + column] == 1
+        end
+        tem(->(value) { allowed.include?(value) })
+      end
+
+      expected = (0...3).to_a.permutation.any? do |mapping|
+        mapping.each_with_index.all? do |tuple_index, template_index|
+          mask[template_index * 3 + tuple_index] == 1
+        end
+      end
+
+      actual = @tb.find_matching_all(templates)
+
+      if expected
+        assert_equal(3, actual.map(&:object_id).uniq.size)
+        actual.each_with_index do |entry, template_index|
+          assert(entries.include?(entry))
+          assert(templates[template_index].match(entry))
+        end
+      else
+        assert_nil(actual)
+      end
+    end
+  end
+
+  def test_find_matching_all_without_templates
+    assert_equal([], @tb.find_matching_all([]))
+  end
+
   def test_has_expires_eh
     assert !@tb.has_expires?
 
@@ -170,4 +230,3 @@ class TestTupleBag < Test::Unit::TestCase
   end
 
 end
-

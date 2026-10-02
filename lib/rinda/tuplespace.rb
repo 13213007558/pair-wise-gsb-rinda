@@ -213,6 +213,39 @@ module Rinda
   end
 
   ##
+  # A WaitAllTemplateEntry waits until a different tuple is available for
+  # every template in a take_all request.
+
+  class WaitAllTemplateEntry < WaitTemplateEntry
+
+    attr_reader :templates
+
+    def initialize(place, tuples, expires=nil)
+      @templates = tuples.collect do |tuple|
+        TemplateEntry.new(tuple)
+      end
+      super(place, [], expires)
+    end
+
+    def match(tuple)
+      @templates.any? do |template|
+        template.match(tuple)
+      end
+    end
+
+    def [](key)
+      @templates.first[key] unless @templates.empty?
+    end
+
+    def broadcast_all_waiters
+      @place.synchronize do
+        @cond.broadcast
+      end
+    end
+
+  end
+
+  ##
   # A NotifyTemplateEntry is returned by TupleSpace#notify and is notified of
   # TupleSpace changes.  You may receive either your subscribed event or the
   # 'close' event when iterating over notifications.
@@ -365,6 +398,19 @@ module Rinda
     end
 
     ##
+    # Finds a distinct live tuple for each template. Returns nil when no
+    # complete assignment exists.
+
+    def find_matching_all(templates)
+      candidates = templates.collect do |template|
+        entries = find_all(template)
+        return nil if entries.empty?
+        entries
+      end
+      find_matching(candidates, (0...templates.size).to_a, [])
+    end
+
+    ##
     # Finds all tuples in the TupleBag which when treated as templates, match
     # +tuple+ and are alive.
 
@@ -372,6 +418,20 @@ module Rinda
       @enum.find_all do |template|
         template.alive? && template.match(tuple)
       end
+    end
+
+    ##
+    # Waiters are matched against a newly written tuple, whose bin key is
+    # usually different from the waiter's bin key. Enumerate all waiters.
+
+    def find_all_waiter_template(tuple)
+      result = []
+      @hash.each_value do |bin|
+        bin.each do |template|
+          result.push(template) if template.alive? && template.match(tuple)
+        end
+      end
+      result
     end
 
     ##
@@ -412,6 +472,28 @@ module Rinda
     def bin_for_find(template)
       key = bin_key(template)
       key ? @hash.fetch(key, []) : @enum
+    end
+
+    def find_matching(candidates, remaining, selected)
+      return selected if remaining.empty? && selected.all?(&:alive?)
+      return nil if remaining.empty?
+
+      index = remaining.min_by do |i|
+        candidates[i].count(&:alive?)
+      end
+
+      candidates[index].each do |tuple|
+        next unless tuple.alive?
+        next if selected.any? { |entry| entry.equal?(tuple) }
+
+        selected[index] = tuple
+        if find_matching(candidates, remaining - [index], selected)
+          return selected
+        end
+        selected[index] = nil
+      end
+
+      nil
     end
   end
 
@@ -462,8 +544,12 @@ module Rinda
           @read_waiter.find_all_template(entry).each do |template|
             template.read(tuple)
           end
-          @take_waiter.find_all_template(entry).each do |template|
-            template.signal
+          @take_waiter.find_all_waiter_template(entry).each do |template|
+            if WaitAllTemplateEntry === template
+              template.broadcast_all_waiters
+            else
+              template.signal
+            end
           end
           notify_event('write', entry.value)
         end
@@ -476,6 +562,40 @@ module Rinda
 
     def take(tuple, sec=nil, &block)
       move(nil, tuple, sec, &block)
+    end
+
+    ##
+    # Atomically removes a different tuple matching each template in
+    # +tuples+. Returns the tuple values in the same order as the templates.
+    #
+    # Waits until all tuples are available if necessary.
+
+    def take_all(tuples, sec=nil, &block)
+      template = WaitAllTemplateEntry.new(self, tuples, sec)
+      yield(template) if block_given?
+
+      synchronize do
+        values = take_all_now(template.templates)
+        return values if values
+
+        raise RequestExpiredError if template.expired?
+
+        begin
+          @take_waiter.push(template)
+          start_keeper if template.expires
+          while true
+            raise RequestCanceledError if template.canceled?
+            raise RequestExpiredError if template.expired?
+
+            values = take_all_now(template.templates)
+            return values if values
+
+            template.wait
+          end
+        ensure
+          @take_waiter.delete(template)
+        end
+      end
     end
 
     ##
@@ -578,6 +698,19 @@ module Rinda
       TupleEntry.new(tuple, sec)
     end
 
+    def take_all_now(templates)
+      entries = @bag.find_matching_all(templates)
+      return nil unless entries
+
+      entries.each do |entry|
+        @bag.delete(entry)
+      end
+      entries.each do |entry|
+        notify_event('take', entry.value)
+      end
+      entries.collect(&:value)
+    end
+
     ##
     # Removes dead tuples.
 
@@ -638,4 +771,3 @@ module Rinda
   end
 
 end
-

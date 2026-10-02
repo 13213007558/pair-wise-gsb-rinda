@@ -145,6 +145,43 @@ module TupleSpaceTestModule
     th.value
   end
 
+  def start_take_all_waiter(templates, sec=10, outcomes=nil, name=:first)
+    omit 'explicit waiter synchronization is tested on the local TupleSpace' unless
+      @ts.is_a?(Rinda::TupleSpace)
+
+    result = Thread::Queue.new
+    state = {entry: nil, waits: 0}
+
+    thread = Thread.start do
+      begin
+        values = @ts.take_all(templates, sec) do |entry|
+          state[:entry] = entry
+          original_wait = entry.method(:wait)
+          entry.define_singleton_method(:wait) do
+            state[:waits] += 1
+            outcomes&.push([name, :waiting, state[:waits]])
+            original_wait.call
+          end
+        end
+        result.push([:ok, values])
+        outcomes&.push([name, :ok, values])
+      rescue Exception => error
+        result.push([:error, error])
+        outcomes&.push([name, :error, error])
+      end
+    end
+
+    {thread: thread, result: result, state: state}
+  end
+
+  def wait_for_waiter_waits(state, count)
+    10_000.times do
+      return if state[:waits] >= count
+      Thread.pass
+    end
+    flunk 'expected take_all waiter to enter wait'
+  end
+
   def test_00_tuple
     tuple = Rinda::TupleEntry.new([1,2,3])
     assert(!tuple.canceled?)
@@ -293,6 +330,185 @@ module TupleSpaceTestModule
     assert_equal([[:symbol, :symbol]], @ts.read_all([:symbol, nil]))
     assert_equal([[:symbol, :symbol]], @ts.read_all([Symbol, nil]))
     assert_equal([], @ts.read_all([:nil, nil]))
+  end
+
+  def test_take_all_duplicate_tuples
+    @ts.write([:take_all, :same])
+    @ts.write([:take_all, :same])
+
+    values = @ts.take_all([[:take_all, :same], [:take_all, :same]], 0)
+
+    assert_equal([[:take_all, :same], [:take_all, :same]], values)
+    assert_equal([], @ts.read_all([nil, nil]))
+  end
+
+  def test_take_all_overlapping_templates
+    @ts.write([:take_all, 0])
+    @ts.write([:take_all, 1])
+    @ts.write([:take_all, 2])
+
+    values = @ts.take_all([[:take_all, Integer], [:take_all, 0], [:take_all, 1]], 0)
+
+    assert_equal([[:take_all, 2], [:take_all, 0], [:take_all, 1]], values)
+    assert_equal([], @ts.read_all([nil, nil]))
+  end
+
+  def test_take_all_without_complete_match_is_atomic
+    @ts.write([:take_all, 0])
+    @ts.write([:take_all, 1])
+
+    assert_raise(Rinda::RequestExpiredError) do
+      @ts.take_all([[:take_all, Integer], [:take_all, 0], [:take_all, 1]], 0)
+    end
+
+    assert_equal([[:take_all, 0], [:take_all, 1]],
+                 @ts.read_all([:take_all, nil]))
+  end
+
+  def test_take_all_waits_for_ordered_tuples
+    omit 'explicit waiter synchronization is tested on the local TupleSpace' unless
+      @ts.is_a?(Rinda::TupleSpace)
+
+    waiter = start_take_all_waiter([[:take_all, :a], [:take_all, :b]])
+    wait_for_waiter_waits(waiter[:state], 1)
+
+    @ts.write([:take_all, :a])
+    wait_for_waiter_waits(waiter[:state], 2)
+    @ts.write([:take_all, :b])
+
+    status, values = waiter[:result].pop
+    assert_equal(:ok, status)
+    assert_equal([[:take_all, :a], [:take_all, :b]], values)
+    assert_equal([], @ts.read_all([nil, nil]))
+  end
+
+  def test_take_all_canceled_request_reevaluates
+    omit 'explicit waiter synchronization is tested on the local TupleSpace' unless
+      @ts.is_a?(Rinda::TupleSpace)
+
+    waiter = start_take_all_waiter([[:take_all, :a], [:take_all, :b]])
+    wait_for_waiter_waits(waiter[:state], 1)
+    waiter[:state][:entry].cancel
+    status, error = waiter[:result].pop
+
+    assert_equal(:error, status)
+    assert_kind_of(Rinda::RequestCanceledError, error)
+
+    @ts.write([:take_all, :a])
+    @ts.write([:take_all, :b])
+    assert_equal([[:take_all, :a], [:take_all, :b]],
+                 @ts.read_all([:take_all, nil]))
+  end
+
+  def test_take_all_expired_request_reevaluates
+    omit 'explicit waiter synchronization is tested on the local TupleSpace' unless
+      @ts.is_a?(Rinda::TupleSpace)
+
+    waiter = start_take_all_waiter([[:take_all, :a], [:take_all, :b]])
+    wait_for_waiter_waits(waiter[:state], 1)
+    entry = waiter[:state][:entry]
+    entry.renew(true)
+    entry.signal
+    status, error = waiter[:result].pop
+
+    assert_equal(:error, status)
+    assert_kind_of(Rinda::RequestExpiredError, error)
+
+    @ts.write([:take_all, :a])
+    @ts.write([:take_all, :b])
+    assert_equal([[:take_all, :a], [:take_all, :b]],
+                 @ts.read_all([:take_all, nil]))
+  end
+
+  def test_take_all_rechecks_expired_tuple
+    omit 'explicit waiter synchronization is tested on the local TupleSpace' unless
+      @ts.is_a?(Rinda::TupleSpace)
+
+    waiter = start_take_all_waiter([[:take_all, :a], [:take_all, :b]])
+    wait_for_waiter_waits(waiter[:state], 1)
+
+    first_a = @ts.write([:take_all, :a])
+    wait_for_waiter_waits(waiter[:state], 2)
+
+    first_a.renew(true)
+    @ts.write([:take_all, :b])
+    wait_for_waiter_waits(waiter[:state], 3)
+
+    @ts.write([:take_all, :a])
+    status, values = waiter[:result].pop
+
+    assert_equal(:ok, status)
+    assert_equal([[:take_all, :a], [:take_all, :b]], values)
+    assert_equal([], @ts.read_all([nil, nil]))
+  end
+
+  def test_take_all_rechecks_after_another_consumer
+    omit 'explicit waiter synchronization is tested on the local TupleSpace' unless
+      @ts.is_a?(Rinda::TupleSpace)
+
+    waiter = start_take_all_waiter([[:take_all, nil], [:take_all, 1]])
+    wait_for_waiter_waits(waiter[:state], 1)
+
+    @ts.write([:take_all, 1])
+    wait_for_waiter_waits(waiter[:state], 2)
+
+    assert_equal([:take_all, 1], @ts.take([:take_all, 1], 0))
+
+    @ts.write([:take_all, 1])
+    wait_for_waiter_waits(waiter[:state], 3)
+    @ts.write([:take_all, 2])
+
+    status, values = waiter[:result].pop
+    assert_equal(:ok, status)
+    assert_equal([[:take_all, 2], [:take_all, 1]], values)
+    assert_equal([], @ts.read_all([nil, nil]))
+  end
+
+  def test_take_all_competing_consumers_are_atomic
+    omit 'explicit waiter synchronization is tested on the local TupleSpace' unless
+      @ts.is_a?(Rinda::TupleSpace)
+
+    @ts.write([:take_all, :first_needed])
+    @ts.write([:take_all, :second_needed])
+
+    outcomes = Thread::Queue.new
+    first = start_take_all_waiter([[:take_all, :first_needed], [:take_all, Integer]],
+                                  10, outcomes, :first)
+    second = start_take_all_waiter([[:take_all, Integer], [:take_all, :second_needed]],
+                                   10, outcomes, :second)
+    wait_for_waiter_waits(first[:state], 1)
+    wait_for_waiter_waits(second[:state], 1)
+
+    @ts.write([:take_all, 1])
+
+    events = []
+    until events.one? { |event| event[1] == :ok } &&
+          events.any? { |event| event[1] == :waiting && event[2] == 2 }
+      events.push(outcomes.pop)
+    end
+    result = events.find { |event| event[1] == :ok }
+    waiting = events.find { |event| event[1] == :waiting && event[2] == 2 }
+    winner = result[0]
+    winner_status = result[1]
+    winner_values = result[2]
+    loser = waiting[0] == :first ? first : second
+    loser_name = waiting[0]
+    @ts.write([:take_all, 2])
+    loser_result = outcomes.pop
+    raise 'unexpected waiter completed' unless loser_result[0] == loser_name
+    loser_status = loser_result[1]
+    loser_values = loser_result[2]
+
+    assert_equal(:ok, winner_status)
+    assert_equal(:ok, loser_status)
+    if winner == :first
+      assert_equal([[:take_all, :first_needed], [:take_all, 1]], winner_values)
+      assert_equal([[:take_all, 2], [:take_all, :second_needed]], loser_values)
+    else
+      assert_equal([[:take_all, 1], [:take_all, :second_needed]], winner_values)
+      assert_equal([[:take_all, :first_needed], [:take_all, 2]], loser_values)
+    end
+    assert_equal([], @ts.read_all([nil, nil]))
   end
 
   def test_core_01
