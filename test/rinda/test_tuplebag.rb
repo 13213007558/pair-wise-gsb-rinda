@@ -134,6 +134,39 @@ class TestTupleBag < Test::Unit::TestCase
     assert_equal [], @tb.find_all_template(tuple), 'expired'
   end
 
+  def test_find_all_match
+    assert_equal [], @tb.find_all_match([])
+
+    t1 = tup(:val, 1)
+    t2 = tup(:val, 2)
+    @tb.push t1
+    @tb.push t2
+
+    assert_equal [t1], @tb.find_all_match([tem(:val, 1)])
+    assert_equal [t1, t2], @tb.find_all_match([tem(:val, 1), tem(:val, 2)])
+
+    # two templates need two distinct tuples
+    assert_equal nil, @tb.find_all_match([tem(:val, 1), tem(:val, 1)])
+
+    matched = @tb.find_all_match([tem(:val, nil), tem(:val, nil)])
+    assert_equal 2, matched.size
+    assert_equal [t1, t2].sort_by(&:object_id), matched.sort_by(&:object_id)
+
+    # overlapping templates: greedy assignment in template order would
+    # pick u1 for the first template and get stuck
+    tb2 = Rinda::TupleBag.new
+    u1 = tup(:b)
+    u2 = tup(:a)
+    tb2.push u1
+    tb2.push u2
+    assert_equal [u2, u1], tb2.find_all_match([tem(nil), tem(:b)])
+
+    # dead tuples are not matched
+    t1.cancel
+    assert_equal nil, @tb.find_all_match([tem(:val, nil), tem(:val, nil)])
+    assert_equal [t2], @tb.find_all_match([tem(:val, nil)])
+  end
+
   def test_has_expires_eh
     assert !@tb.has_expires?
 
@@ -170,4 +203,3 @@ class TestTupleBag < Test::Unit::TestCase
   end
 
 end
-

@@ -430,6 +430,223 @@ module TupleSpaceTestModule
     assert_equal([[:take, 1]], @ts.read_all([nil, nil]))
   end
 
+  def test_take_all_basic
+    @ts.write([:task, 1])
+    @ts.write([:res, 'a'])
+    @ts.write([:res, 'b'])
+
+    assert_equal([[:task, 1], [:res, 'a'], [:res, 'b']],
+                 @ts.take_all([[:task, Integer], [:res, String], [:res, String]], 0))
+    assert_equal([], @ts.read_all([nil, nil]))
+  end
+
+  def test_take_all_immediate_and_wait_return_same_order
+    @ts.write([:a, 1])
+    @ts.write([:b, 2])
+    immediate = @ts.take_all([[:b, nil], [:a, nil]], 0)
+    assert_equal([[:b, 2], [:a, 1]], immediate)
+
+    @ts.write([:a, 1])
+    @ts.write([:b, 2])
+    assert_equal(immediate, @ts.take_all([[:b, nil], [:a, nil]]))
+    assert_equal([], @ts.read_all([nil, nil]))
+  end
+
+  def test_take_all_overlapping_templates
+    # written in this order, a greedy assignment in template order would
+    # take [:b] for [nil] and then find nothing for [:b]
+    @ts.write([:b])
+    @ts.write([:a])
+
+    assert_equal([[:a], [:b]], @ts.take_all([[nil], [:b]], 0))
+    assert_equal([], @ts.read_all([nil]))
+  end
+
+  def test_take_all_duplicate_tuples_are_distinct
+    @ts.write([:x, 1])
+    assert_raise(Rinda::RequestExpiredError) do
+      @ts.take_all([[:x, 1], [:x, 1]], 0)
+    end
+    assert_equal([[:x, 1]], @ts.read_all([:x, nil]))
+
+    @ts.write([:x, 1])
+    assert_equal([[:x, 1], [:x, 1]], @ts.take_all([[:x, 1], [:x, 1]], 0))
+    assert_equal([], @ts.read_all([nil, nil]))
+  end
+
+  def test_take_all_failure_removes_nothing
+    @ts.write([:task, 1])
+    assert_raise(Rinda::RequestExpiredError) do
+      @ts.take_all([[:task, nil], [:res, nil]], 0)
+    end
+    assert_equal([[:task, 1]], @ts.read_all([nil, nil]))
+  end
+
+  def test_take_all_waits_for_whole_group
+    started = Queue.new
+    result = Queue.new
+    consumer = Thread.new do
+      result.push(@ts.take_all([[:task, nil], [:res, nil]]) do |w|
+        started.push(true)
+      end)
+    end
+    started.pop
+
+    @ts.write([:task, 1])
+    # the group is incomplete, so the tuple must not be removed
+    assert_equal([[:task, 1]], @ts.read_all([nil, nil]))
+
+    @ts.write([:res, 'r'])
+    assert_equal([[:task, 1], [:res, 'r']], result.pop)
+    consumer.join
+    assert_equal([], @ts.read_all([nil, nil]))
+  end
+
+  def test_take_all_timeout_removes_nothing
+    @ts.write([:task, 1])
+    consumer = Thread.new do
+      assert_raise(Rinda::RequestExpiredError) do
+        @ts.take_all([[:task, nil], [:res, nil]], 1)
+      end
+    end
+    sleep(10)
+    thread_join(consumer)
+    assert_equal([[:task, 1]], @ts.read_all([nil, nil]))
+  end
+
+  def test_take_all_cancel_removes_nothing
+    @ts.write([:task, 1])
+    template = nil
+    consumer = Thread.new do
+      assert_raise(Rinda::RequestCanceledError) do
+        @ts.take_all([[:task, nil], [:res, nil]], 10) do |t|
+          template = t
+          Thread.new do
+            t.cancel
+          end
+        end
+      end
+    end
+    sleep(2)
+    thread_join(consumer)
+
+    assert(template.canceled?)
+    assert_equal([[:task, 1]], @ts.read_all([nil, nil]))
+  end
+
+  def test_take_all_reevaluates_after_tuple_expires
+    @ts.write([:task, 1], 1)
+    started = Queue.new
+    result = Queue.new
+    consumer = Thread.new do
+      result.push(@ts.take_all([[:task, nil], [:res, nil]], 30) do |w|
+        started.push(true)
+      end)
+    end
+    started.pop
+
+    sleep(2) # let [:task, 1] expire
+    wait_until { @ts.read_all([nil, nil]).empty? }
+
+    @ts.write([:res, 'r'])
+    @ts.write([:task, 2])
+    assert_equal([[:task, 2], [:res, 'r']], result.pop)
+    consumer.join
+    assert_equal([], @ts.read_all([nil, nil]))
+  end
+
+  def test_take_all_reevaluates_when_tuples_taken
+    started = Queue.new
+    result = Queue.new
+    consumer = Thread.new do
+      result.push(@ts.take_all([[:task, nil], [:res, nil]]) do |w|
+        started.push(true)
+      end)
+    end
+    started.pop
+
+    @ts.write([:task, 1])
+    # another consumer grabs the only :task tuple first
+    assert_equal([:task, 1], @ts.take([:task, nil], 0))
+
+    @ts.write([:res, 'r'])
+    @ts.write([:task, 2])
+    assert_equal([[:task, 2], [:res, 'r']], result.pop)
+    consumer.join
+    assert_equal([], @ts.read_all([nil, nil]))
+  end
+
+  def test_take_all_exhaustive_small_spaces
+    tuple_pool = [[:a], [:b]]
+    template_pool = [[nil], [:a], [:b]]
+
+    spaces = (0..3).flat_map do |n|
+      tuple_pool.repeated_permutation(n).to_a
+    end
+    template_sets = (1..3).flat_map do |n|
+      template_pool.repeated_permutation(n).to_a
+    end
+
+    solvable = 0
+    spaces.each do |tuples|
+      template_sets.each do |templates|
+        expected = templates.size <= tuples.size &&
+          (0...tuples.size).to_a.permutation.any? do |perm|
+            perm.first(templates.size).each_with_index.all? do |ti, i|
+              Rinda::Template.new(templates[i]).match(tuples[ti])
+            end
+          end
+
+        tuples.each do |tuple|
+          @ts.write(tuple)
+        end
+        begin
+          if expected
+            solvable += 1
+            result = @ts.take_all(templates, 0)
+            assert_equal(templates.size, result.size,
+                         "space=#{tuples.inspect} templates=#{templates.inspect}")
+            used = Array.new(tuples.size, false)
+            result.each_with_index do |tuple, i|
+              assert(Rinda::Template.new(templates[i]).match(tuple),
+                     "template #{templates[i].inspect} does not match #{tuple.inspect}")
+              idx = tuples.each_index.find do |j|
+                !used[j] && tuples[j] == tuple
+              end
+              assert(idx, "returned #{tuple.inspect} is not in #{tuples.inspect}")
+              used[idx] = true
+            end
+            remaining = tuples.each_with_index.reject do |_, j|
+              used[j]
+            end.map(&:first)
+            assert_equal(remaining.sort, @ts.read_all([nil]).sort,
+                         "space=#{tuples.inspect} templates=#{templates.inspect}")
+          else
+            assert_raise(Rinda::RequestExpiredError,
+                         "space=#{tuples.inspect} templates=#{templates.inspect}") do
+              @ts.take_all(templates, 0)
+            end
+            assert_equal(tuples.sort, @ts.read_all([nil]).sort,
+                         "space=#{tuples.inspect} templates=#{templates.inspect}")
+          end
+        ensure
+          @ts.read_all([nil]).each do |tuple|
+            @ts.take(tuple, 0)
+          end
+        end
+      end
+    end
+    assert(solvable > 0, 'expected some solvable cases')
+    assert(solvable < spaces.size * template_sets.size,
+           'expected some unsolvable cases')
+  end
+
+  def wait_until
+    Timeout.timeout(10) do
+      Thread.pass until yield
+    end
+  end
+
   class SimpleRenewer
     def initialize(sec, n = 1)
       @sec = sec

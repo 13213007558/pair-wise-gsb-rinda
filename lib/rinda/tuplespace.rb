@@ -213,6 +213,37 @@ module Rinda
   end
 
   ##
+  # A WaitAllTemplateEntry waits until a whole group of templates can be
+  # matched against distinct tuples.  It matches any tuple that matches at
+  # least one of its templates, so that a TupleSpace can wake it whenever a
+  # potentially interesting tuple is written.
+
+  class WaitAllTemplateEntry < WaitTemplateEntry
+
+    ##
+    # The ordered list of Rinda::Template objects to match.
+
+    attr_reader :templates
+
+    def initialize(place, templates, expires=nil)
+      @templates = templates.map do |template|
+        template.is_a?(Rinda::Template) ? template : Rinda::Template.new(template)
+      end
+      super(place, [], expires)
+    end
+
+    ##
+    # Matches if +tuple+ matches any of the templates in the group.
+
+    def match(tuple)
+      @templates.any? do |template|
+        template.match(tuple)
+      end
+    end
+
+  end
+
+  ##
   # A NotifyTemplateEntry is returned by TupleSpace#notify and is notified of
   # TupleSpace changes.  You may receive either your subscribed event or the
   # 'close' event when iterating over notifications.
@@ -362,6 +393,33 @@ module Rinda
       bin_for_find(template).find do |tuple|
         tuple.alive? && template.match(tuple)
       end
+    end
+
+    ##
+    # Finds a distinct live tuple for each of +templates+, returning an
+    # Array of entries in the same order as +templates+, or nil if no such
+    # assignment exists.  Templates may overlap; every valid assignment is
+    # considered, so a group is found whenever one exists.
+
+    def find_all_match(templates)
+      candidates = templates.map do |template|
+        find_all(template)
+      end
+      return nil if candidates.any?(&:empty?)
+      matched = Array.new(templates.size)
+      used = {}
+      assign = lambda do |i|
+        return true if i == templates.size
+        candidates[i].each do |entry|
+          next if used[entry]
+          used[entry] = true
+          matched[i] = entry
+          return true if assign.call(i + 1)
+          used.delete(entry)
+        end
+        false
+      end
+      assign.call(0) ? matched : nil
     end
 
     ##
@@ -516,6 +574,60 @@ module Rinda
     end
 
     ##
+    # Removes and returns an ordered group of tuples, one for each of
+    # +templates+.  Every template is matched against a different tuple, so
+    # two identical templates require two distinct (possibly identical)
+    # tuples.
+    #
+    # The group is taken atomically: either every template is satisfied and
+    # all matched tuples are removed, or no tuple is removed at all.
+    #
+    # Returns an Array of tuples in the same order as +templates+, both in
+    # immediate mode (+sec+ is 0) and when waiting.  Raises
+    # RequestExpiredError if no complete group becomes available within
+    # +sec+ seconds, and RequestCanceledError if the request is canceled.
+
+    def take_all(templates, sec=nil, &block)
+      waiter = WaitAllTemplateEntry.new(self, templates, sec)
+      yield(waiter) if block_given?
+      synchronize do
+        entries = @bag.find_all_match(waiter.templates)
+        if entries
+          entries.each do |entry|
+            @bag.delete(entry)
+            notify_event('take', entry.value)
+          end
+          return entries.collect do |entry|
+            entry.value
+          end
+        end
+        raise RequestExpiredError if waiter.expired?
+
+        begin
+          @take_waiter.push(waiter)
+          start_keeper if waiter.expires
+          while true
+            raise RequestCanceledError if waiter.canceled?
+            raise RequestExpiredError if waiter.expired?
+            entries = @bag.find_all_match(waiter.templates)
+            if entries
+              entries.each do |entry|
+                @bag.delete(entry)
+                notify_event('take', entry.value)
+              end
+              return entries.collect do |entry|
+                entry.value
+              end
+            end
+            waiter.wait
+          end
+        ensure
+          @take_waiter.delete(waiter)
+        end
+      end
+    end
+
+    ##
     # Reads +tuple+, but does not remove it.
 
     def read(tuple, sec=nil)
@@ -638,4 +750,3 @@ module Rinda
   end
 
 end
-
